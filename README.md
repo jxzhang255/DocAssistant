@@ -9,7 +9,7 @@
 
 ## Introduction
 
-This repository contains the official implementation of the EMNLP 2025 Findings paper: **"[Please Insert Paper Title Here]"**.
+This repository contains the official implementation of the EMNLP 2025 Findings paper: **"DocAssistant: Integrating Key-region Reading and Step-wise Reasoning for Robust Document Visual Question Answering"**.
 
 **DocAssistant** is a powerful multimodal model designed for document understanding tasks, including DocVQA, ChartQA, and InfographicsVQA. It builds upon the InternVL architecture to achieve state-of-the-art performance in processing visually rich documents.
 
@@ -31,44 +31,6 @@ pip install -r requirements.txt
 ```
 
 For more detailed installation steps, please refer to [INSTALLATION.md](./INSTALLATION.md).
-
-## Model Zoo
-
-| Model | Description | Download |
-| :--- | :--- | :--- |
-| DocAssistant-Base | Base model for document understanding | [Coming Soon] |
-| DocAssistant-Chat | Chat-tuned model for interactive QA | [Coming Soon] |
-
-## Quick Start
-
-### Inference
-
-You can use the following script to run inference on your own images:
-
-```python
-import torch
-from PIL import Image
-from transformers import AutoModel, AutoTokenizer
-
-model_path = "path/to/docassistant/model"
-model = AutoModel.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True).cuda().eval()
-tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-
-image = Image.open("examples/image1.jpg").convert('RGB')
-pixel_values = ... # Add preprocessing here based on your specific implementation
-
-response = model.chat(tokenizer, pixel_values, "Describe this document.")
-print(response)
-```
-
-## Evaluation
-
-We provide scripts to reproduce the results on DocVQA, ChartQA, and other benchmarks.
-
-```bash
-# Evaluate on DocVQA
-bash evaluate.sh docvqa
-```
 
 ## Citation
 
