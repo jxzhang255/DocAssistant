@@ -334,13 +334,13 @@ def preprocess_phi3(
     # Apply prompt templates
     conversations = []
     for i, source in enumerate(sources):
-        if roles[source[0]['from']] != conv.roles[0]:
+        if roles[source[0]["from"]] != conv.roles[0]:
             # Skip the first one if it is not from human
             source = source[1:]
 
         conv.messages = []
         for j, sentence in enumerate(source):
-            role = roles[sentence['from']]
+            role = roles[sentence["from"]]
             assert role == conv.roles[j % 2], f'{i}'
             conv.append_message(role, sentence['value'])
         conversations.append(conv.get_prompt())
@@ -543,13 +543,13 @@ def preprocess_internlm(
     # Apply prompt templates
     conversations = []
     for i, source in enumerate(sources):
-        if roles[source[0]['from']] != conv.roles[0]:
+        if roles[source[0]["from"]] != conv.roles[0]:
             # Skip the first one if it is not from human
             source = source[1:]
 
         conv.messages = []
         for j, sentence in enumerate(source):
-            role = roles[sentence['from']]
+            role = roles[sentence["from"]]
             assert role == conv.roles[j % 2], f'{i}'
             sentence['value'] = sentence['value'].strip()
             if sentence['value'][0] == '\n':

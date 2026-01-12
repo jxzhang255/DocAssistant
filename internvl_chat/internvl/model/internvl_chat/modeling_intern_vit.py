@@ -11,13 +11,19 @@ import torch.utils.checkpoint
 from einops import rearrange
 from timm.models.layers import DropPath
 from torch import nn
+from torch.nn import init
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (BaseModelOutput,
                                            BaseModelOutputWithPooling)
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
-
+from einops import rearrange, repeat, reduce, pack, unpack
 from .configuration_intern_vit import InternVisionConfig
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
 
 try:
     from .flash_attention import FlashAttention
@@ -117,6 +123,7 @@ class InternAttention(nn.Module):
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.use_flash_attn = config.use_flash_attn and has_flash_attn
+        # self.use_flash_attn = False
         if config.use_flash_attn and not has_flash_attn:
             print('Warning: Flash Attention is not available, use_flash_attn is set to False.')
         self.head_dim = self.embed_dim // self.num_heads
@@ -128,6 +135,7 @@ class InternAttention(nn.Module):
 
         self.scale = self.head_dim ** -0.5
         self.qkv = nn.Linear(self.embed_dim, 3 * self.embed_dim, bias=config.qkv_bias)
+  
         self.attn_drop = nn.Dropout(config.attention_dropout)
         self.proj_drop = nn.Dropout(config.dropout)
 
@@ -140,11 +148,20 @@ class InternAttention(nn.Module):
         if self.use_flash_attn:
             self.inner_attn = FlashAttention(attention_dropout=config.attention_dropout)
         self.proj = nn.Linear(self.embed_dim, self.embed_dim)
+        # self.prefix_gate = torch.nn.Parameter(torch.zeros(1, self.num_heads, 1, 1))
+        self.gate_proj = nn.Linear(self.embed_dim, self.embed_dim)
 
-    def _naive_attn(self, x):
+
+    def _naive_attn(self, x,text_embeds):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+        target_dtype = self.qkv.weight.dtype
+
+        # if text_embeds is not None:
+        #     B,L,C = text_embeds.shape
+        #     prefix_qkv = self.qkv(text_embeds.to(target_dtype)).reshape(B, L, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        #     prefix_q,prefix_k,prefix_v = prefix_qkv.unbind(0)
 
         if self.qk_normalization:
             B_, H_, N_, D_ = q.shape
@@ -155,31 +172,51 @@ class InternAttention(nn.Module):
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = (attn @ v).transpose(1, 2)
+
+        # if text_embeds is not None:
+        #     prefix_attn = ((q * self.scale) @ prefix_k.transpose(-2, -1))
+        #     prefix_attn = prefix_attn.softmax(dim=-1)
+        #     prefix_attn = self.attn_drop(prefix_attn)
+
+        #     prefix_x = (prefix_attn @ prefix_v).transpose(1, 2)
+        #     prefix_delta = self.prefix_gate.view(1, 1, -1, 1).tanh() * prefix_x
+        #     x = x + prefix_delta
+        x = x.reshape(B,N,C).contiguous()
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x
+        return x, attn
 
     def _flash_attn(self, x, key_padding_mask=None, need_weights=False):
+        B, N, C = x.shape
         qkv = self.qkv(x)
         qkv = rearrange(qkv, 'b s (three h d) -> b s three h d', three=3, h=self.num_heads)
+        q, k, v = qkv.unbind(2)
 
         if self.qk_normalization:
-            q, k, v = qkv.unbind(2)
             q = self.q_norm(q.flatten(-2, -1)).view(q.shape)
             k = self.k_norm(k.flatten(-2, -1)).view(k.shape)
             qkv = torch.stack([q, k, v], dim=2)
 
-        context, _ = self.inner_attn(
+
+        context, attn_weights = self.inner_attn(
             qkv, key_padding_mask=key_padding_mask, need_weights=need_weights, causal=False
         )
+
         outs = self.proj(rearrange(context, 'b s h d -> b s (h d)'))
         outs = self.proj_drop(outs)
-        return outs
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        x = self._naive_attn(hidden_states) if not self.use_flash_attn else self._flash_attn(hidden_states)
-        return x
+        if need_weights:
+            return outs, attn_weights
+        return outs, None
+
+    def forward(self, hidden_states, text_embeds=None, need_weights: bool = False) -> torch.Tensor:
+        if not self.use_flash_attn:
+            x, attn_weights = self._naive_attn(hidden_states, text_embeds)
+            if not need_weights:
+                attn_weights = None
+            return x, attn_weights
+        return self._flash_attn(hidden_states, need_weights=need_weights)
 
 
 class InternMLP(nn.Module):
@@ -208,25 +245,39 @@ class InternVisionEncoderLayer(nn.Module):
         self.mlp = InternMLP(config)
         self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
         self.norm2 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
-
+        
         self.ls1 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
         self.ls2 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
         self.drop_path1 = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
         self.drop_path2 = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
 
+
     def forward(
             self,
             hidden_states: torch.Tensor,
+            text_embeds,
+            output_attentions: bool = False
+
     ) -> Tuple[torch.FloatTensor, Optional[torch.FloatTensor], Optional[Tuple[torch.FloatTensor]]]:
         """
         Args:
             hidden_states (`Tuple[torch.FloatTensor, Optional[torch.FloatTensor]]`): input to the layer of shape `(batch, seq_len, embed_dim)`
-        """
-        hidden_states = hidden_states + self.drop_path1(self.attn(self.norm1(hidden_states)) * self.ls1)
+        """  
+        
+        # hidden_states = hidden_states + self.drop_path1(self.attn(self.norm1(hidden_states),text_embeds) * self.ls1)
 
-        hidden_states = hidden_states + self.drop_path2(self.mlp(self.norm2(hidden_states)) * self.ls2)
+        # hidden_states = hidden_states + self.drop_path2(self.mlp(self.norm2(hidden_states)) * self.ls2)
+        # 注意力层
+        attn_output, attn_weights = self.attn(self.norm1(hidden_states), text_embeds, need_weights=output_attentions)
+        hidden_states = hidden_states + self.drop_path1(attn_output * self.ls1)
 
-        return hidden_states
+        # MLP层
+        mlp_output = self.mlp(self.norm2(hidden_states))
+        hidden_states = hidden_states + self.drop_path2(mlp_output * self.ls2)
+        
+        return hidden_states, attn_weights
+        
+        # return hidden_states
 
 
 class InternVisionEncoder(nn.Module):
@@ -251,6 +302,8 @@ class InternVisionEncoder(nn.Module):
     def forward(
             self,
             inputs_embeds,
+            text_embeds,
+            output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutput]:
@@ -267,32 +320,39 @@ class InternVisionEncoder(nn.Module):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
+        output_attentions = output_attentions if output_attentions is not None else getattr(self.config, 'output_attentions', False)
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         encoder_states = () if output_hidden_states else None
         hidden_states = inputs_embeds
-
+        all_attn_weights = () if output_attentions else None
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
             if self.gradient_checkpointing and self.training:
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     encoder_layer,
-                    hidden_states)
+                    hidden_states,
+                    text_embeds
+                )
             else:
                 layer_outputs = encoder_layer(
                     hidden_states,
+                    text_embeds,
+                    output_attentions=output_attentions
                 )
-            hidden_states = layer_outputs
+
+            hidden_states, attn_weights = layer_outputs
+            if output_attentions:
+                all_attn_weights = all_attn_weights + (attn_weights,)
 
         if output_hidden_states:
             encoder_states = encoder_states + (hidden_states,)
 
+
         if not return_dict:
-            return tuple(v for v in [hidden_states, encoder_states] if v is not None)
-        return BaseModelOutput(
-            last_hidden_state=hidden_states, hidden_states=encoder_states
-        )
+            return tuple(v for v in [hidden_states, encoder_states, all_attn_weights] if v is not None)
+        return hidden_states, encoder_states, all_attn_weights
 
 
 class InternVisionModel(PreTrainedModel):
@@ -306,6 +366,15 @@ class InternVisionModel(PreTrainedModel):
 
         self.embeddings = InternVisionEmbeddings(config)
         self.encoder = InternVisionEncoder(config)
+
+        self.llm_hidden_size = 2048
+        self.union = nn.Sequential(
+            nn.LayerNorm(self.llm_hidden_size),
+            nn.Linear(self.llm_hidden_size, config.hidden_size),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, config.hidden_size)
+        )
+        
 
     def resize_pos_embeddings(self, old_size, new_size, patch_size):
         pos_emb = self.embeddings.position_embedding
@@ -325,6 +394,8 @@ class InternVisionModel(PreTrainedModel):
     def forward(
             self,
             pixel_values: Optional[torch.FloatTensor] = None,
+            text_embeds: Optional[torch.FloatTensor] = None,
+            output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
             pixel_embeds: Optional[torch.FloatTensor] = None,
@@ -342,22 +413,99 @@ class InternVisionModel(PreTrainedModel):
         else:
             if len(pixel_values.shape) == 4:
                 hidden_states = self.embeddings(pixel_values)
+                if text_embeds is not None:
+                    batch_size, _, _ = hidden_states.shape
+                    text_embeds = text_embeds.repeat(batch_size, 1, 1)
+                    text_embeds = self.union(text_embeds)
+                    hidden_states = torch.cat([hidden_states, text_embeds], dim=1)
+
             else:
                 raise ValueError(f'wrong pixel_values size: {pixel_values.shape}')
-        encoder_outputs = self.encoder(
+        
+        hidden_states,encoder_states, all_attn_weights = self.encoder(
             inputs_embeds=hidden_states,
+            text_embeds=None,
+            output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        last_hidden_state = encoder_outputs.last_hidden_state
+        last_hidden_state = hidden_states
         pooled_output = last_hidden_state[:, 0, :]
 
-        if not return_dict:
-            return (last_hidden_state, pooled_output) + encoder_outputs[1:]
 
-        return BaseModelOutputWithPooling(
-            last_hidden_state=last_hidden_state,
-            pooler_output=pooled_output,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
-        )
+        if not return_dict:
+            return (last_hidden_state, pooled_output, hidden_states, all_attn_weights) + (encoder_states,)
+
+        return last_hidden_state, pooled_output, hidden_states, all_attn_weights
+
+
+def cls_attention_map(
+        last_attn: torch.Tensor,
+        pixel_values: torch.Tensor,
+        patch_size: int,
+) -> torch.Tensor:
+    if last_attn is None:
+        raise ValueError('last_attn is None. 请在 forward 时传 output_attentions=True。')
+    if last_attn.dim() != 4:
+        raise ValueError(f'Expect last_attn with shape [B, heads, T, T], got {tuple(last_attn.shape)}')
+
+    grid_h = pixel_values.shape[-2] // patch_size
+    grid_w = pixel_values.shape[-1] // patch_size
+    num_img_tokens = 1 + grid_h * grid_w
+
+    # 只取 CLS 对图像 patch token 的注意力（忽略后续可能拼接的文本 token）
+    cls_to_patch = last_attn[:, :, 0, 1:num_img_tokens]  # [B, heads, num_patches]
+    attn_map = cls_to_patch.mean(dim=1)  # [B, num_patches]
+    attn_map = attn_map.reshape(attn_map.shape[0], grid_h, grid_w)
+
+    min_v = attn_map.amin(dim=(-2, -1), keepdim=True)
+    max_v = attn_map.amax(dim=(-2, -1), keepdim=True)
+    attn_map = (attn_map - min_v) / (max_v - min_v + 1e-6)
+    return attn_map
+
+
+def attention_heatmap(
+        attn_map: torch.Tensor,
+        save_path: str,
+        image: Optional[torch.Tensor] = None,
+        alpha: float = 0.45,
+        cmap: str = 'jet',
+) -> None:
+
+    if attn_map.dim() == 2:
+        attn_map = attn_map.unsqueeze(0)
+    if attn_map.dim() != 3:
+        raise ValueError(f'Expect attn_map with shape [B,h,w] or [h,w], got {tuple(attn_map.shape)}')
+
+    batch = attn_map.shape[0]
+    for i in range(batch):
+        heat = attn_map[i].detach().float().cpu().numpy()
+
+        fig = plt.figure(figsize=(6, 6), dpi=200)
+        ax = plt.gca()
+        ax.axis('off')
+
+        if image is not None:
+            img = image
+            if isinstance(img, torch.Tensor):
+                if img.dim() == 4:
+                    img = img[i]
+                if img.dim() == 3 and img.shape[0] == 3:
+                    img = img.permute(1, 2, 0)
+                img = img.detach().float().cpu().numpy()
+            img = np.clip(img, 0, 1)
+            ax.imshow(img)
+
+            heat_t = torch.from_numpy(heat).unsqueeze(0).unsqueeze(0)
+            heat_up = F.interpolate(heat_t, size=img.shape[:2], mode='bilinear', align_corners=False)
+            heat_up = heat_up.squeeze().numpy()
+            ax.imshow(heat_up, cmap=cmap, alpha=alpha)
+        else:
+            ax.imshow(heat, cmap=cmap)
+
+        out = save_path
+        if batch > 1:
+            root, ext = os.path.splitext(save_path)
+            out = f'{root}_{i}{ext or ".png"}'
+        plt.savefig(out, bbox_inches='tight', pad_inches=0)
+        plt.close(fig)

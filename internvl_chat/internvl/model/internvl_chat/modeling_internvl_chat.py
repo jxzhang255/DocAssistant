@@ -5,6 +5,7 @@
 # --------------------------------------------------------
 import warnings
 from typing import Any, List, Optional, Tuple, Union
+import math
 
 import torch.utils.checkpoint
 from internvl.model.internlm2.modeling_internlm2 import InternLM2ForCausalLM
@@ -17,12 +18,71 @@ from transformers import (AutoModel, GenerationConfig, LlamaForCausalLM,
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, logging
+import torch.nn.functional as F
+from einops import rearrange, repeat, reduce, pack, unpack
 
 from .configuration_internvl_chat import InternVLChatConfig
 from .modeling_intern_vit import InternVisionModel
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import numpy as np
+import json
 
 logger = logging.get_logger(__name__)
 
+class MLPMoE(nn.Module):
+    def __init__(self, num_experts, num_selected, mm_channels, channels, dropout=False):
+        super().__init__()
+        self.num_experts = num_experts
+        self.num_selected = num_selected
+        self.mm_channels = mm_channels
+        self.channels = channels
+
+        self.gate = nn.Linear(mm_channels, num_experts, bias=False)
+        self.num_selected = num_selected
+        self.num_experts = num_experts
+        self.experts = nn.ModuleList([nn.Sequential(nn.Linear(mm_channels, channels), nn.GELU(), nn.Linear(channels, channels)) for _ in range(num_experts)])
+        # self.union = nn.Sequential(nn.LayerNorm(channels),nn.Linear(channels, mm_channels), nn.GELU(), nn.Linear(mm_channels, mm_channels))
+        # self.mha_layer = torch.nn.MultiheadAttention(embed_dim=mm_channels, kdim=mm_channels, vdim=mm_channels, num_heads=1, batch_first=True)
+        # self.gate_dense = nn.Linear(2*mm_channels, mm_channels)
+        # self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x_img, text):
+        print('x_img:',x_img.shape)
+        print('text:',text.shape)
+        # batch_size, image_seq, embed_dim = x_img.shape
+        # text_embeds = text.repeat(batch_size,1,1)
+        # text_embeds = self.union(text_embeds)
+      
+        # fusion,_ = self.mha_layer(x_img,text_embeds,text_embeds)
+        # merge = torch.cat([x_img, fusion], dim=-1)
+        # gate = self.sigmoid(self.gate_dense(merge))
+        # fusion = (1 - gate) * x_img + gate * fusion
+        gate_logits = self.gate(x_img)
+        router_z_loss = torch.logsumexp(gate_logits, dim = -1)
+        router_z_loss = torch.square(router_z_loss)            
+        router_z_loss = router_z_loss.mean()
+        
+        gate_softmax = F.softmax(gate_logits, dim=-1, dtype=torch.float).to(x_img.dtype)
+
+        density_1_proxy = reduce(gate_softmax, '... n e -> ... e', 'mean')
+
+        weights, selected_experts = torch.topk(gate_softmax, self.num_selected)
+
+        one_hot_gate_indices = F.one_hot(rearrange(selected_experts, '... k -> k ...'), self.num_experts).float()[0]
+        density_1 = reduce(one_hot_gate_indices, '... n e -> ... e', 'mean')
+        balance_loss = (density_1_proxy * density_1).mean() * float(self.num_experts ** 2)
+
+        weights = weights / torch.sum(weights, dim=-1, keepdim=True).to(x_img.dtype)
+        
+        results = torch.zeros((x_img.shape[0], x_img.shape[1], self.channels)).to(x_img.device, x_img.dtype)
+
+        for b in range(x_img.shape[0]):
+            for i, expert in enumerate(self.experts):
+                token_idx, nth_expert = torch.where(selected_experts[b] == i)
+                results[b][token_idx] += weights[b][token_idx, nth_expert, None] * expert(x_img[b][token_idx])
+        return results, balance_loss, router_z_loss
 
 class InternVLChatModel(PreTrainedModel):
     config_class = InternVLChatConfig
@@ -31,7 +91,7 @@ class InternVLChatModel(PreTrainedModel):
 
     def __init__(self, config: InternVLChatConfig, vision_model=None, language_model=None):
         super().__init__(config)
-
+        self.config = config
         image_size = config.force_image_size or config.vision_config.image_size
         patch_size = config.vision_config.patch_size
         self.patch_size = patch_size
@@ -61,6 +121,7 @@ class InternVLChatModel(PreTrainedModel):
 
         vit_hidden_size = config.vision_config.hidden_size
         llm_hidden_size = config.llm_config.hidden_size
+        self.attn_maps = []
 
         self.mlp1 = nn.Sequential(
             nn.LayerNorm(vit_hidden_size * int(1 / self.downsample_ratio) ** 2),
@@ -68,7 +129,7 @@ class InternVLChatModel(PreTrainedModel):
             nn.GELU(),
             nn.Linear(llm_hidden_size, llm_hidden_size)
         )
-
+        # self.mlp1 = MLPMoE(4,2,vit_hidden_size * int(1 / self.downsample_ratio) ** 2,llm_hidden_size)
         # if config.force_image_size != config.vision_config.image_size:
         #     self.vision_model.resize_pos_embeddings(
         #         old_size=config.vision_config.image_size,
@@ -88,6 +149,7 @@ class InternVLChatModel(PreTrainedModel):
     def wrap_backbone_lora(self, r=128, lora_alpha=256, lora_dropout=0.05):
         lora_config = LoraConfig(
             r=r,
+            # target_modules=['attn.q_proj', 'attn.k_proj', 'attn.v_proj', 'attn.proj', 'mlp.fc1', 'mlp.fc2'],
             target_modules=['attn.qkv', 'attn.proj', 'mlp.fc1', 'mlp.fc2'],
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
@@ -98,8 +160,8 @@ class InternVLChatModel(PreTrainedModel):
     def wrap_llm_lora(self, r=128, lora_alpha=256, lora_dropout=0.05):
         lora_config = LoraConfig(
             r=r,
-            target_modules=['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_attn.o_proj',
-                            'mlp.gate_proj', 'mlp.down_proj', 'mlp.up_proj'],
+            target_modules=['wqkv'],
+            # target_modules=['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_attn.proj'],
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
             task_type='CAUSAL_LM'
@@ -107,7 +169,7 @@ class InternVLChatModel(PreTrainedModel):
         self.language_model = get_peft_model(self.language_model, lora_config)
         self.language_model.enable_input_require_grads()
         self.language_model.print_trainable_parameters()
-
+    
     def forward(
             self,
             pixel_values: torch.FloatTensor,
@@ -127,7 +189,9 @@ class InternVLChatModel(PreTrainedModel):
         image_flags = image_flags.squeeze(-1)
         input_embeds = self.language_model.get_input_embeddings()(input_ids).clone()
 
-        vit_embeds = self.extract_feature(pixel_values)
+        vit_embeds = self.extract_feature(pixel_values, input_embeds.clone())
+        print('vit_embeds:',vit_embeds.shape)
+        print('input_embeds:',input_embeds.shape)
         vit_embeds = vit_embeds[image_flags == 1]
         vit_batch_size = pixel_values.shape[0]
 
@@ -175,6 +239,9 @@ class InternVLChatModel(PreTrainedModel):
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
 
+            loss += 0.5*balance_loss
+            loss += 0.5*router_z_loss
+
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
@@ -209,28 +276,30 @@ class InternVLChatModel(PreTrainedModel):
         noise = torch.zeros_like(vit_embeds).uniform_(-mag_norm, mag_norm)
         return vit_embeds + noise
 
-    def extract_feature(self, pixel_values):
+
+    def extract_feature(self, pixel_values, input_embeds):
+        v_embeds,pooled_output,hidden_states, all_attn_weights = self.vision_model(
+            pixel_values=pixel_values,
+            text_embeds=input_embeds,
+            output_hidden_states=False,
+            return_dict=True)
+
         if self.select_layer == -1:
-            vit_embeds = self.vision_model(
-                pixel_values=pixel_values,
-                output_hidden_states=False,
-                return_dict=True).last_hidden_state
+            v_embeds = v_embeds
         else:
-            vit_embeds = self.vision_model(
-                pixel_values=pixel_values,
-                output_hidden_states=True,
-                return_dict=True).hidden_states[self.select_layer]
-        vit_embeds = vit_embeds[:, 1:, :]
+            v_embeds = hidden_states[self.select_layer]
+        v_embeds = v_embeds[:, 1:, :]
 
         if self.training and self.neftune_alpha is not None:
-            vit_embeds = self.noised_embed(vit_embeds, self.neftune_alpha)
+            v_embeds = self.noised_embed(v_embeds, self.neftune_alpha)
 
-        h = w = int(vit_embeds.shape[1] ** 0.5)
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
-        vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
-        vit_embeds = self.mlp1(vit_embeds)#.to(pixel_values.device)
-        return vit_embeds
+        h = w = int(v_embeds.shape[1] ** 0.5)
+        v_embeds = v_embeds.reshape(v_embeds.shape[0], h, w, -1)
+        v_embeds = self.pixel_shuffle(v_embeds, scale_factor=self.downsample_ratio)
+        v_embeds = v_embeds.reshape(v_embeds.shape[0], -1, v_embeds.shape[-1])
+        # v_embeds,balance_loss, router_z_loss = self.mlp1(v_embeds,input_embeds)#.to(pixel_values.device)
+        v_embeds = self.mlp1(v_embeds)
+        return v_embeds
 
     def chat(self, tokenizer, pixel_values, question, generation_config, history=None, return_history=False,
              IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>'):
@@ -340,12 +409,12 @@ class InternVLChatModel(PreTrainedModel):
 
         assert self.img_context_token_id is not None
         if pixel_values is not None:
+
+            input_embeds = self.language_model.get_input_embeddings()(input_ids)
             if visual_features is not None:
                 vit_embeds = visual_features
             else:
-                vit_embeds = self.extract_feature(pixel_values)
-
-            input_embeds = self.language_model.get_input_embeddings()(input_ids)
+                vit_embeds,_,_ = self.extract_feature(pixel_values,input_embeds)
             B, N, C = input_embeds.shape
             input_embeds = input_embeds.reshape(B * N, C)
 

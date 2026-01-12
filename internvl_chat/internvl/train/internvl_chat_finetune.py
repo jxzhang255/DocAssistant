@@ -4,13 +4,16 @@ import math
 import os
 import random
 import sys
+
+sys.path.append(os.path.abspath(__file__).rsplit('/', 3)[0])
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-import orjson as json
+import json
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 import transformers
 from internvl.dist_utils import init_dist
@@ -110,11 +113,11 @@ class ModelArguments:
         metadata={'help': 'Specify the layer of ViT feature map to use. Default is last layer.'},
     )
     use_backbone_lora: int = field(
-        default=0,
+        default=128,
         metadata={'help': 'Set the LoRA adapter rank for the backbone model. Default is 0.'}
     )
     use_llm_lora: int = field(
-        default=0,
+        default=128,
         metadata={'help': 'Set the LoRA adapter rank for the LLM. Default is 0.'}
     )
     unfreeze_lm_head: bool = field(
@@ -202,7 +205,6 @@ class DataTrainingArguments:
         metadata={'help': 'The normalize type for the image. Default is imagenet.'},
     )
 
-
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
@@ -223,14 +225,16 @@ class LazySupervisedDataset(Dataset):
         self.is_train = is_train
         self.pad2square = pad2square
         logger.info('Formatting inputs...Skip in lazy mode')
-        assert meta['annotation'].endswith('jsonl'), f'annotation must be jsonl, but got {meta["annotation"]}'
-        with open(meta['annotation'], 'r') as f:
-            self.raw_data = f.readlines()
+        # assert meta['annotation'].endswith('jsonl'), f'annotation must be jsonl, but got {meta["annotation"]}'
+        with open(meta, 'r') as f:
+            self.raw_data = json.load(f)
             if repeat_time < 1:
                 # choice top len(self.raw_data) * repeat_time samples
                 self.raw_data = self.raw_data[:int(len(self.raw_data) * repeat_time)]
         gc.collect()
-        self.root = meta['root']
+        # self.root = "/home/jxzhang/datasets/InfographicVQA/infographicVQA_train_v1.0_images"
+        # self.root = '/home/jxzhang/datasets/DUE_Benchmark/ChartQA/train'
+        self.root = '/home/jxzhang/datasets/DUE_Benchmark/DocVQA/pngs'
         self.cached_data_dict = {}
         self.tcs_loader = tcs_loader
         self.group_by_length = group_by_length
@@ -243,7 +247,6 @@ class LazySupervisedDataset(Dataset):
             self.conv2length = {}  # using dict to speedup the calculation of token length
             self.length = []
             for data_item in self.raw_data:
-                data_item = json.loads(data_item)
                 if 'length' in data_item:
                     token_length = data_item['length']  # use precomputed length if exists
                 else:
@@ -265,12 +268,13 @@ class LazySupervisedDataset(Dataset):
 
     def multi_modal_get_item(self, data_item):
         if '<image>' not in data_item['conversations'][0]['value']:
+            # ocr = "<ocr>"+data_item['ocr_text']+"</ocr>\n"
             data_item['conversations'][0]['value'] = '<image>\n' + data_item['conversations'][0]['value']
 
         if data_item['image'].startswith('s3://'):
             image_path = self.root + data_item['image']
         else:
-            image_path = os.path.join(self.root, data_item['image'])
+            image_path = os.path.join(self.root, data_item['image'][10:])
         if self.tcs_loader is not None:
             image = self.tcs_loader(image_path)
         else:
@@ -341,67 +345,66 @@ class LazySupervisedDataset(Dataset):
         i = i % len(self.raw_data)
         while True:
             try:
-                data_item = json.loads(self.raw_data[i])
-                if 'image' in data_item and len(data_item['image']) != 0:
+                data_item = self.raw_data[i]
+                if 'image' in data_item.keys() and len(data_item['image']) != 0:
                     ret = self.multi_modal_get_item(data_item)
                 else:
                     ret = self.pure_text_get_item(data_item)
                 break
             except Exception as e:
                 print(e)
-                data_item = json.loads(self.raw_data[i])
+                data_item = self.raw_data[i]
                 if 'image' in data_item:
                     if data_item['image'].startswith('s3://'):
                         data_path = self.root + data_item['image']
                     else:
-                        data_path = os.path.join(self.root, data_item['image'])
+                        data_path = os.path.join(self.root, data_item['image'][10:])
                     print(f'Failed to load image: {data_path}, the dataset is: {self.ds_name}')
                 i = random.randint(0, len(self.raw_data) - 1)
         return ret
 
 
 def build_datasets(data_args, tokenizer, tcs_loader, model, group_by_length=False,
-                   dynamic_image_size=False, use_thumbnail=False, min_dynamic_patch=1,
-                   max_dynamic_patch=6, normalize_type='imagenet'):
+                   dynamic_image_size=True, use_thumbnail=False, min_dynamic_patch=1,
+                   max_dynamic_patch=12, normalize_type='imagenet'):
     datasets = []
     lengths = []
-    ds_collections = json.loads(open(data_args.meta_path).read())
-    for ds_name in ds_collections.keys():
-        repeat_time = ds_collections[ds_name]['repeat_time']
-        if 'max_dynamic_patch' in ds_collections[ds_name]:
-            max_num = ds_collections[ds_name]['max_dynamic_patch']
-            logger.info(f'max_dynamic_patch is set to {max_num} according to the meta file')
-        else:
-            max_num = max_dynamic_patch
-        try:
-            dataset = LazySupervisedDataset(
-                data_args.conv_style, ds_collections[ds_name],
-                tokenizer,
-                tcs_loader,
-                num_image_token=model.num_image_token,
-                image_size=data_args.force_image_size,
-                is_train=ds_collections[ds_name]['data_augment'],
-                pad2square=data_args.pad2square,
-                group_by_length=group_by_length,
-                dynamic_image_size=dynamic_image_size,
-                use_thumbnail=use_thumbnail,
-                min_dynamic_patch=min_dynamic_patch,
-                max_dynamic_patch=max_num,
-                repeat_time=repeat_time,
-                normalize_type=normalize_type,
-            )
-        except Exception:
-            logger.info(f'Error in loading dataset: {ds_name}')
-            exit()
-        dataset.ds_name = ds_name
-        repeat_time = 1 if repeat_time < 1 else repeat_time  # don't repeat if repeat_time is less than 1
-        for i in range(repeat_time):
-            logger.info(f'Add dataset:{ds_name}_{i} with length: {len(dataset)}')
-            datasets.append(dataset)
-            if data_args.use_data_resampling:
-                lengths.append(math.sqrt(len(dataset)))
-            else:
-                lengths.append(len(dataset))
+    # ds_collections = json.load(open(data_args.meta_path))
+    # for ds_name in ds_collections.keys():
+        # repeat_time = ds_collections[ds_name]['repeat_time']
+        # if 'max_dynamic_patch' in ds_collections[ds_name]:
+        #     max_num = ds_collections[ds_name]['max_dynamic_patch']
+        #     logger.info(f'max_dynamic_patch is set to {max_num} according to the meta file')
+        # else:
+    max_num = max_dynamic_patch
+    dataset = LazySupervisedDataset(
+        data_args.conv_style, data_args.meta_path,
+        tokenizer,
+        tcs_loader,
+        num_image_token=model.num_image_token,
+        image_size=data_args.force_image_size,
+        is_train=False,
+        pad2square=data_args.pad2square,
+        group_by_length=group_by_length,
+        dynamic_image_size=dynamic_image_size,
+        use_thumbnail=use_thumbnail,
+        min_dynamic_patch=min_dynamic_patch,
+        max_dynamic_patch=max_num,
+        repeat_time=1,
+        normalize_type=normalize_type,
+    )
+    # except Exception:
+    #     logger.info(f'Error in loading dataset: docvqa')
+    #     exit()
+    dataset.ds_name = "docvqa_train_10k"
+    repeat_time = 1 
+    # for i in range(repeat_time):
+        # logger.info(f'Add dataset:{ds_name}_{i} with length: {len(dataset)}')
+    datasets.append(dataset)
+    if data_args.use_data_resampling:
+        lengths.append(math.sqrt(len(dataset)))
+    else:
+        lengths.append(len(dataset))
     if data_args.use_data_resampling:
         total_length = sum(lengths)
         weights = [l / total_length for l in lengths]
@@ -502,7 +505,7 @@ def main():
         config.min_dynamic_patch = data_args.min_dynamic_patch
         config.max_dynamic_patch = data_args.max_dynamic_patch
         model = InternVLChatModel.from_pretrained(
-            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config)
+            model_args.model_name_or_path,_fast_init=False, torch_dtype=torch.bfloat16, config=config)
     else:
         logger.info('Loading ViT-6B...')
         vision_config = InternVisionConfig.from_pretrained(model_args.vision_path)
@@ -538,6 +541,8 @@ def main():
         state_dict = torch.load(model_args.mlp_path, map_location='cpu')
         message = model.mlp1.load_state_dict(state_dict)
         logger.info(message)
+    # else:
+        
     logger.info('Finished')
 
     patch_size = model.config.vision_config.patch_size

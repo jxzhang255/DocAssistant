@@ -169,3 +169,16 @@ internvl_chat/data/
 Husky2/*
 data_process/
 *distillation*
+
+# Project specific ignores
+output/
+work_dirs/
+save_data/
+*.out
+*.log
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.bin
+wandb/
