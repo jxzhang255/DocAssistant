@@ -18,7 +18,6 @@ This repository contains the official implementation of the EMNLP 2025 Findings 
 ## News 🚀
 
 - **[2025/11]** DocAssistant is accepted to **EMNLP 2025 Findings**! 🎉
-- **[2025/11]** Code and models are released.
 
 ## Installation
 
